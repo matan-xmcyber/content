@@ -152,24 +152,6 @@ DEVICE_MAP = {
 }
 
 
-class LongRunningIntegrationLogger(IntegrationLogger):
-    """
-    LOG class that ignores LOG calls if long_running
-    """
-
-    def __init__(self, long_running=False):
-        super().__init__()
-        self.long_running = long_running
-
-    def __call__(self, message):
-        # ignore messages if self.long_running
-        if not self.long_running:
-            super().__call__(message)
-
-
-LOG = LongRunningIntegrationLogger(demisto.command() == "long-running-execution")
-
-
 class FetchMode:
     """Enum class for fetch mode"""
 
@@ -224,15 +206,11 @@ class QRadarClient:
         try:
             log_hdr = deepcopy(headers)
             sec_hdr = log_hdr.pop("SEC", None)
-            formatted_params = json.dumps(params, indent=4)
             # default on sec_hdr, else, try username/password
             auth = (
                 (self._username, self._password)
                 if not sec_hdr and self._username and self._password
                 else None
-            )
-            LOG(
-                f"qradar is attempting {method} to {url} with headers:\n{headers}\nparams:\n{formatted_params}"
             )
             res = requests.request(
                 method,
@@ -267,10 +245,7 @@ class QRadarClient:
         try:
             json_body = res.json()
         except ValueError:
-            LOG(
-                "Got unexpected response from QRadar. Raw response: {}".format(res.text)
-            )
-            raise DemistoException("Got unexpected response from QRadar")
+            raise DemistoException(f"Got unexpected response from QRadar. Raw response: {res.text}")
         return json_body
 
     def test_connection(self):
@@ -740,6 +715,9 @@ def test_module(client: QRadarClient):
     params = demisto.params()
     is_long_running = params.get("longRunning")
     if is_long_running:
+        if not params.get('events_limit'):
+            raise DemistoException('Unlimited long running instance fetch is not supported, please limit your fetch'
+                                   ' by using the "Max number of events per incident" parameter.')
         # check fetch incidents can fetch and search events
         raw_offenses = client.get_offenses(_range="0-0")
         fetch_mode = params.get("fetch_mode")
@@ -2002,9 +1980,9 @@ def get_indicators_list(indicator_query, limit, page):
     """
     indicators_values_list = []
     indicators_data_list = []
-    fetched_iocs = demisto.searchIndicators(
-        query=indicator_query, page=page, size=limit
-    ).get("iocs")
+    search_indicators = IndicatorsSearcher(page=page)
+    fetched_iocs = search_indicators.search_indicators_by_version(query=indicator_query, size=limit).get("iocs")
+
     for indicator in fetched_iocs:
         indicators_values_list.append(indicator["value"])
         indicators_data_list.append(
@@ -2024,31 +2002,39 @@ def fetch_loop_with_events(
     events_limit,
 ):
     while True:
-        is_reset_triggered(client.lock, handle_reset=True)
+        try:
+            is_reset_triggered(client.lock, handle_reset=True)
 
-        print_debug_msg("Starting fetch loop with events.")
-        fetch_incidents_long_running_events(
-            client,
-            incident_type,
-            user_query,
-            ip_enrich,
-            asset_enrich,
-            fetch_mode,
-            events_columns,
-            events_limit,
-        )
-        time.sleep(FETCH_SLEEP)
+            print_debug_msg("Starting fetch loop with events.")
+            fetch_incidents_long_running_events(
+                client,
+                incident_type,
+                user_query,
+                ip_enrich,
+                asset_enrich,
+                fetch_mode,
+                events_columns,
+                events_limit,
+            )
+        except Exception as e:
+            demisto.error(str(e))
+        finally:
+            time.sleep(FETCH_SLEEP)
 
 
 def fetch_loop_no_events(client: QRadarClient, incident_type, user_query, ip_enrich, asset_enrich):
     while True:
-        is_reset_triggered(client.lock, handle_reset=True)
+        try:
+            is_reset_triggered(client.lock, handle_reset=True)
 
-        print_debug_msg("Starting fetch loop with no events.")
-        fetch_incidents_long_running_no_events(
-            client, incident_type, user_query, ip_enrich, asset_enrich
-        )
-        time.sleep(FETCH_SLEEP)
+            print_debug_msg("Starting fetch loop with no events.")
+            fetch_incidents_long_running_no_events(
+                client, incident_type, user_query, ip_enrich, asset_enrich
+            )
+        except Exception as e:
+            demisto.error(e)
+        finally:
+            time.sleep(FETCH_SLEEP)
 
 
 def long_running_main(
@@ -2347,14 +2333,8 @@ def main():
         elif command == "get-mapping-fields":
             demisto.results(get_mapping_fields(client))
     except Exception as e:
-        error = f"Error has occurred in the QRadar Integration: {str(e)}"
-        LOG(traceback.format_exc())
-        if demisto.command() == "fetch-incidents":
-            LOG(error)
-            LOG.print_log()
-            raise Exception(error)
-        else:
-            return_error(error)
+        error = f"Error has occurred in the QRadar Integration: {str(e)}\n{traceback.format_exc()}"
+        return_error(error)
 
 
 if __name__ in ("__builtin__", "builtins", "__main__"):
